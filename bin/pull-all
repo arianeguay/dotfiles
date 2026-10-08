@@ -46,7 +46,7 @@ report() {
     skip) color=$dim;    symbol='-'; (( attention++ )) ;;
     fail) color=$red;    symbol='x'; (( failed++ )) ;;
   esac
-  printf '%s%s%s %-34s %s\n' "$color" "$symbol" "$reset" "$(short "$repo")" "$message"
+  printf '%s%s%s %-*s %s\n' "$color" "$symbol" "$reset" "$width" "$(short "$repo")" "$message"
 }
 
 # Untracked files are ignored on purpose: a fast-forward cannot silently overwrite
@@ -72,7 +72,7 @@ on_target() {
   [[ -z $target || $branch == "$target" ]] && return 0
 
   if (( interactive )) && ! repo_is_dirty "$repo"; then
-    printf '? %-34s on %s, switch to %s? [y/N] ' "$(short "$repo")" "$branch" "$target" >/dev/tty
+    printf '? %-*s on %s, switch to %s? [y/N] ' "$width" "$(short "$repo")" "$branch" "$target" >/dev/tty
     read -r answer </dev/tty
     if [[ $answer == [yY]* ]] && git -C "$repo" switch --quiet "$target" 2>/dev/null; then
       return 0
@@ -125,9 +125,19 @@ process_repo() {
 interactive=0
 [[ -t 0 && -t 1 ]] && interactive=1
 
+# The repo column fits the longest path, plus a gap, so messages line up.
+repos=()
+width=0
 while IFS= read -r repo; do
-  process_repo "$repo"
+  repos+=("$repo")
+  name=$(short "$repo")
+  (( ${#name} > width )) && width=${#name}
 done < <(find_repos)
+(( width += 2 ))
+
+for repo in ${repos[@]+"${repos[@]}"}; do
+  process_repo "$repo"
+done
 
 
 printf '\n%d up to date - %d to check - %d failed\n' "$ok" "$attention" "$failed"
