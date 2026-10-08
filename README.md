@@ -10,6 +10,14 @@ mkdir -p ~/.local/bin
 ln -sfn ~/dotfiles/bin/pull-all ~/.local/bin/pull-all
 ```
 
+On macOS, `~/.local/bin` is not on the PATH by default:
+
+```
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+```
+
+Works with macOS's own bash 3.2 and BSD `find`.
+
 ## pull-all
 
 Fast-forwards every git repository under `~/dev`, `~/src` and `~/dotfiles`, or under
