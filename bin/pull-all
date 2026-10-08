@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Fast-forward every git repository found under the given directories.
+# Never stashes, merges or forces: a repository that cannot fast-forward is left untouched.
+#
+# Usage: pull-all [DIR...]   (default: ~/dev ~/src ~/dotfiles)
+
+set -uo pipefail
+
+if (( $# )); then
+  ROOTS=("$@")
+else
+  ROOTS=("$HOME/dev" "$HOME/src" "$HOME/dotfiles")
+fi
+
+ok=0
+attention=0
+failed=0
+
+if [[ -t 1 ]]; then
+  green=$'\e[32m'; yellow=$'\e[33m'; red=$'\e[31m'; dim=$'\e[2m'; reset=$'\e[0m'
+else
+  green=''; yellow=''; red=''; dim=''; reset=''
+fi
+
+# Nested repositories are pulled too. One without an origin is skipped silently:
+# those are tool caches, not ours to update.
+find_repos() {
+  local root
+  for root in "${ROOTS[@]}"; do
+    [[ -d $root ]] || continue
+    find "$root" -type d \( -name '.*' -a ! -name .git \) -prune -o \
+                 -type d -name .git -printf '%h\n' 2>/dev/null
+  done | sort
+}
+
+report() {
+  local repo=$1 state=$2 message=$3 color symbol
+  case $state in
+    ok)   color=$green;  symbol='v'; (( ok++ )) ;;
+    warn) color=$yellow; symbol='!'; (( attention++ )) ;;
+    skip) color=$dim;    symbol='-'; (( attention++ )) ;;
+    fail) color=$red;    symbol='x'; (( failed++ )) ;;
+  esac
+  printf '%s%s%s %-34s %s\n' "$color" "$symbol" "$reset" "${repo/#$HOME/\~}" "$message"
+}
+
+# Untracked files are ignored on purpose: a fast-forward cannot silently overwrite
+# them, and stray backup files would otherwise block every run.
+repo_is_dirty() {
+  local repo=$1
+  ! git -C "$repo" diff-index --quiet HEAD --
+}
+
+# The target is `git config pull-all.target` when set, else the remote's default branch.
+target_branch() {
+  local repo=$1
+  git -C "$repo" config pull-all.target ||
+    git -C "$repo" symbolic-ref --short -q refs/remotes/origin/HEAD | sed 's|^origin/||'
+}
+
+# A checkout off its target is reported, not pulled. Only a terminal is asked to
+# switch, and only a clean checkout: cron must never wait on a prompt.
+on_target() {
+  local repo=$1 target branch answer
+  target=$(target_branch "$repo")
+  branch=$(git -C "$repo" symbolic-ref --short -q HEAD) || branch='detached HEAD'
+  [[ -z $target || $branch == "$target" ]] && return 0
+
+  if (( interactive )) && ! repo_is_dirty "$repo"; then
+    printf '? %-34s on %s, switch to %s? [y/N] ' "${repo/#$HOME/\~}" "$branch" "$target" >/dev/tty
+    read -r answer </dev/tty
+    if [[ $answer == [yY]* ]] && git -C "$repo" switch --quiet "$target" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  report "$repo" warn "on $branch, target $target"
+  return 1
+}
+
+process_repo() {
+  local repo=$1 upstream before after count ahead
+
+  git -C "$repo" remote get-url origin >/dev/null 2>&1 || return
+
+  if ! git -C "$repo" fetch --quiet --prune 2>/dev/null; then
+    report "$repo" fail "fetch failed"
+    return
+  fi
+
+  on_target "$repo" || return
+
+  if ! upstream=$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null); then
+    report "$repo" skip "no upstream"
+    return
+  fi
+
+  if repo_is_dirty "$repo"; then
+    report "$repo" warn "local changes"
+    return
+  fi
+
+  before=$(git -C "$repo" rev-parse HEAD)
+  if ! git -C "$repo" merge --ff-only --quiet "$upstream" 2>/dev/null; then
+    report "$repo" warn "diverged"
+    return
+  fi
+  after=$(git -C "$repo" rev-parse HEAD)
+
+  ahead=$(git -C "$repo" rev-list --count "$upstream..HEAD")
+  if (( ahead > 0 )); then
+    report "$repo" warn "$ahead unpushed commit(s)"
+  elif [[ $before == "$after" ]]; then
+    report "$repo" ok "up to date"
+  else
+    count=$(git -C "$repo" rev-list --count "$before..$after")
+    report "$repo" ok "$count new commit(s)"
+  fi
+}
+
+interactive=0
+[[ -t 0 && -t 1 ]] && interactive=1
+
+while IFS= read -r repo; do
+  process_repo "$repo"
+done < <(find_repos)
+
+
+printf '\n%d up to date - %d to check - %d failed\n' "$ok" "$attention" "$failed"
+(( failed == 0 ))
