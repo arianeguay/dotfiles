@@ -53,6 +53,8 @@ report() {
 # them, and stray backup files would otherwise block every run.
 repo_is_dirty() {
   local repo=$1
+  # diff-index trusts cached stat info, so a file whose mtime alone changed reads as dirty.
+  git -C "$repo" update-index -q --refresh >/dev/null
   ! git -C "$repo" diff-index --quiet HEAD --
 }
 
