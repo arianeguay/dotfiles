@@ -8,6 +8,7 @@ Personal command-line tools, shared across machines.
 git clone https://github.com/arianeguay/dotfiles.git ~/dotfiles
 mkdir -p ~/.local/bin
 ln -sfn ~/dotfiles/bin/pull-all ~/.local/bin/pull-all
+ln -sfn ~/dotfiles/bin/claude-context ~/.local/bin/claude-context
 ```
 
 On macOS, `~/.local/bin` is not on the PATH by default:
@@ -16,7 +17,7 @@ On macOS, `~/.local/bin` is not on the PATH by default:
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 ```
 
-Works with macOS's own bash 3.2 and BSD `find`.
+`pull-all` works with macOS's own bash 3.2 and BSD `find`. `claude-context` needs Python 3.9 or later.
 
 ## pull-all
 
@@ -32,4 +33,17 @@ not pulled. In a terminal, a clean one is offered a switch; under cron it never 
 pull-all                    # default directories
 pull-all ~/work ~/dotfiles  # explicit directories
 git -C ~/work/app config pull-all.target develop
+```
+
+## claude-context
+
+Context size and token usage of every Claude Code session on the machine, read from the
+transcripts in `~/.claude/projects`, by day and by ISO week in Montreal time. Each
+transcript is classed as a conversation, a subagent, or background work (conversation
+summaries and subagent warmups), so the session counts are not inflated by the latter.
+
+```
+claude-context                       # last 4 weeks, by day and week
+claude-context --weeks 2 --sessions  # also list each conversation by title
+claude-context --csv ~/context.csv   # one row per transcript, for a pivot table
 ```

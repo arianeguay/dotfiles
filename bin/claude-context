@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Context and token usage of every Claude Code session on this machine, by day and week.
+
+Usage: claude-context [--weeks N] [--sessions] [--csv PATH]
+"""
+import argparse
+import csv
+import glob
+import json
+import os
+import statistics
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo("America/Toronto")
+ROOT = os.path.expanduser("~/.claude/projects")
+KINDS = ("conversation", "subagent", "summarizer", "warmup")
+
+
+def first_text(d):
+    c = d["message"]["content"]
+    return c if isinstance(c, str) else " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+
+
+def classify(d):
+    text = first_text(d)
+    if text == "Warmup":
+        return "warmup"
+    if text.startswith("Context: This summary will be shown"):
+        return "summarizer"
+    return "subagent" if d.get("isSidechain") else "conversation"
+
+
+def load(path, since):
+    kind, session_id, custom, ai = None, None, None, None
+    seen, calls = set(), []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = d.get("type")
+            if t == "custom-title":
+                custom = d.get("customTitle")
+            elif t == "ai-title":
+                ai = d.get("aiTitle")
+            elif t == "user" and kind is None:
+                kind, session_id = classify(d), d.get("sessionId")
+            msg = d.get("message")
+            u = msg.get("usage") if isinstance(msg, dict) else None
+            rid = d.get("requestId") or d.get("uuid")
+            if not u or rid in seen or not d.get("timestamp"):
+                continue
+            seen.add(rid)
+            ts = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00"))
+            if ts < since:
+                continue
+            ctx = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+            calls.append((ts, ctx, u.get("cache_read_input_tokens", 0), u.get("output_tokens", 0)))
+    if not calls:
+        return None
+    calls.sort()
+    return {
+        "kind": kind or "conversation",
+        "session_id": session_id,
+        "title": custom or ai or "",
+        "project": os.path.relpath(path, ROOT).split(os.sep)[0],
+        "calls": calls,
+    }
+
+
+def load_all(since):
+    rows = []
+    for path in glob.glob(f"{ROOT}/**/*.jsonl", recursive=True):
+        if datetime.fromtimestamp(os.path.getmtime(path), timezone.utc) >= since and (s := load(path, since)):
+            rows.append(s)
+    titles = {s["session_id"]: s["title"] for s in rows if s["kind"] == "conversation" and s["title"]}
+    for s in rows:
+        s["title"] = s["title"] or titles.get(s["session_id"], "")
+        c = s["calls"]
+        s["start"] = c[0][0].astimezone(TZ)
+        s["start_ctx"] = c[0][1]
+        s["peak_ctx"] = max(x[1] for x in c)
+        s["input"] = sum(x[1] for x in c)
+        s["cached"] = sum(x[2] for x in c)
+        s["output"] = sum(x[3] for x in c)
+    return rows
+
+
+def fmt(n):
+    return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}k"
+
+
+def report(title, rows, key):
+    buckets = defaultdict(list)
+    for s in rows:
+        buckets[key(s)].append(s)
+    print(f"\n## {title}\n")
+    print(f"{'period':<12}{'convs':>6}{'subagents':>10}{'background':>11}{'start ctx':>11}{'peak ctx':>10}{'input':>9}{'cached %':>9}{'output':>8}")
+    for k in sorted(buckets):
+        b = buckets[k]
+        n = {kind: sum(s["kind"] == kind for s in b) for kind in KINDS}
+        starts = [s["start_ctx"] for s in b if s["kind"] == "conversation"] or [0]
+        total_in = sum(s["input"] for s in b)
+        cached = sum(s["cached"] for s in b)
+        print(
+            f"{k:<12}{n['conversation']:>6}{n['subagent']:>10}{n['summarizer'] + n['warmup']:>11}"
+            f"{fmt(statistics.median(starts)):>11}{fmt(max(s['peak_ctx'] for s in b)):>10}"
+            f"{fmt(total_in):>9}{cached / total_in * 100 if total_in else 0:>8.0f}%{fmt(sum(s['output'] for s in b)):>8}"
+        )
+
+
+def write_csv(path, rows):
+    fields = ["date", "week", "time", "kind", "title", "project", "session_id", "calls", "start_ctx", "peak_ctx", "input", "cached", "output"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(fields)
+        for s in sorted(rows, key=lambda s: s["start"]):
+            w.writerow([
+                f"{s['start']:%Y-%m-%d}", f"{s['start']:%G-W%V}", f"{s['start']:%H:%M}", s["kind"], s["title"], s["project"],
+                s["session_id"], len(s["calls"]), s["start_ctx"], s["peak_ctx"], s["input"], s["cached"], s["output"],
+            ])
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--weeks", type=int, default=4)
+    p.add_argument("--sessions", action="store_true", help="also list each conversation")
+    p.add_argument("--csv", metavar="PATH", help="write one row per transcript to PATH")
+    args = p.parse_args()
+
+    since = datetime.now(timezone.utc) - timedelta(weeks=args.weeks)
+    rows = load_all(since)
+
+    print(f"Claude Code sessions since {since.astimezone(TZ):%Y-%m-%d} (Montreal time)")
+    print("background = conversation summaries and subagent warmups; start ctx = median first-call context of conversations")
+    report("By day", rows, lambda s: f"{s['start']:%Y-%m-%d}")
+    report("By week", rows, lambda s: f"{s['start']:%G-W%V}")
+
+    if args.sessions:
+        print("\n## Conversations\n")
+        subs = defaultdict(int)
+        for s in rows:
+            if s["kind"] == "subagent":
+                subs[s["session_id"]] += s["input"]
+        for s in sorted((s for s in rows if s["kind"] == "conversation"), key=lambda s: s["start"]):
+            print(
+                f"{s['start']:%Y-%m-%d %H:%M}  {len(s['calls']):>4} calls  start {fmt(s['start_ctx']):>5}  peak {fmt(s['peak_ctx']):>5}"
+                f"  input {fmt(s['input']):>6}  subagents {fmt(subs[s['session_id']]):>6}  {s['title'] or '(untitled)'}"
+            )
+
+    if args.csv:
+        write_csv(args.csv, rows)
+        print(f"\nCSV: {len(rows)} rows written to {args.csv}")
+
+
+if __name__ == "__main__":
+    main()
