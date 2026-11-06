@@ -6,10 +6,11 @@ Personal command-line tools, shared across machines.
 
 ```
 git clone https://github.com/arianeguay/dotfiles.git ~/dotfiles
-mkdir -p ~/.local/bin
-ln -sfn ~/dotfiles/bin/pull-all ~/.local/bin/pull-all
-ln -sfn ~/dotfiles/bin/claude-context ~/.local/bin/claude-context
+~/dotfiles/bin/pull-all ~/dotfiles
 ```
+
+Every run links each tool in `bin/` into `~/.local/bin`, so a new tool reaches a machine with
+its next pull. A file or link already at that path is left alone.
 
 On macOS, `~/.local/bin` is not on the PATH by default:
 

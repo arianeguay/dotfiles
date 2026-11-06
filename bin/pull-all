@@ -141,6 +141,14 @@ for repo in ${repos[@]+"${repos[@]}"}; do
   process_repo "$repo"
 done
 
+# A tool added to this repo reaches each machine with its next pull. An existing
+# link stays: on the homelab hosts, pull-all's own points into the ops repo.
+mkdir -p "$HOME/.local/bin"
+for tool in "$HOME"/dotfiles/bin/*; do
+  link=$HOME/.local/bin/${tool##*/}
+  [[ -f $tool && -x $tool && ! -e $link && ! -L $link ]] || continue
+  ln -s "$tool" "$link" && printf 'linked %s\n' "$(short "$link")"
+done
 
 printf '\n%d up to date - %d to check - %d failed\n' "$ok" "$attention" "$failed"
 (( failed == 0 ))
