@@ -51,9 +51,10 @@ claude-context --reset 2026-11-09T01:59         # weeks of 7 days ending Monday 
 claude-context --weeks 2 --sessions             # also list each conversation by title
 claude-context --csv ~/context.csv              # one row per transcript, for a pivot table
 claude-context --json ~/context.json            # counts per host, bucket, cwd, model and kind
+claude-context --studio-json ~/studio.json      # Studio's own counts per week, repo and model
 ```
 
-The JSON holds counts only: no prompt text, titles or file content.
+Both JSON files hold counts only: no prompt text, titles or file content. Keep them apart: a Studio call can be in both.
 
 Reading the report:
 
@@ -62,4 +63,4 @@ Reading the report:
 - **w5m and w1h** are cache writes by lifetime. Only Claude models count: a local model reached through `ANTHROPIC_BASE_URL` is named and left out of the tables.
 - **studio** counts sessions Studio's Claude provider spawned, which otherwise read as conversations under the parent's entrypoint.
 - **Images** are estimated as width x height / 750. They are read back on each call until a compaction, which costs far more than sending them once. On one repo the real context jump ran about 1.22 times this estimate.
-- **Studio's own records** come from `.studio/runs` under `~/dev` and `~/src`, shown by week beside the transcripts of Studio sessions. Compare the totals, not repo by repo: a run's record and its transcripts can sit under different repos. On 2026-11-06 they agreed except for 268 Haiku entries with no transcript, about 6 M tokens.
+- **Studio's own records** come from `.studio/runs` anywhere under the home directory, shown by week beside the transcripts of Studio sessions. Compare the totals, not repo by repo: a run's record and its transcripts can sit under different repos. On 2026-11-06 they agreed except for 268 Haiku entries with no transcript, about 6 M tokens. A pipeline in a container keeps its records there, out of reach, so only its transcripts show (skynet-counter on apollon).

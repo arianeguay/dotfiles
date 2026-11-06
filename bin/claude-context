@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Context and token usage of every Claude Code session on this machine, by day and week.
 
-Usage: claude-context [--weeks N] [--reset ISO_DATETIME (default Sundays 18:00)] [--sessions] [--csv PATH] [--json PATH]
+Usage: claude-context [--weeks N] [--reset ISO_DATETIME (default Sundays 18:00)] [--sessions] [--csv PATH] [--json PATH] [--studio-json PATH]
 """
 import argparse
 import base64
@@ -51,9 +51,9 @@ def classify(d):
         return "summarizer"
     if d.get("isSidechain"):
         return "subagent"
-    # Studio's Claude provider spawns the CLI with skip-permissions in the project's directory.
-    # Its entrypoint is inherited from the parent, so it cannot tell a Studio stage apart.
-    if d.get("cwd") and d.get("permissionMode") == "bypassPermissions" and os.path.isdir(os.path.join(project_of(d["cwd"]), ".studio")):
+    # Studio's Claude provider spawns the CLI with skip-permissions; nothing else here does (measured on every host,
+    # 2026-11-06). Its entrypoint is inherited, and its cwd can exist only inside a container, like skynet-counter's /app.
+    if d.get("permissionMode") == "bypassPermissions":
         return "studio"
     return "conversation"
 
@@ -300,17 +300,18 @@ def report_images(calls, week):
 def studio_run_dirs():
     # A checkout's runs directory can be a link to a worktree's, so one directory has two paths.
     seen = set()
-    for root in ("~/dev", "~/src"):
-        for path, dirs, _ in os.walk(os.path.expanduser(root)):
-            runs = os.path.join(path, "runs")
-            if path.endswith("/.studio") and "runs" in dirs and os.path.realpath(runs) not in seen:
-                seen.add(os.path.realpath(runs))
-                yield runs
-            dirs[:] = [x for x in dirs if x != "node_modules" and (not x.startswith(".") or x in (".studio", ".worktrees"))]
+    home = os.path.expanduser("~")
+    for path, dirs, _ in os.walk(home):
+        runs = os.path.join(path, "runs")
+        if path.endswith("/.studio") and "runs" in dirs and os.path.realpath(runs) not in seen:
+            seen.add(os.path.realpath(runs))
+            yield runs
+        if path[len(home):].count("/") >= 10:
+            dirs[:] = []
+        dirs[:] = [x for x in dirs if x != "node_modules" and (not x.startswith(".") or x in (".studio", ".worktrees"))]
 
 
-def report_studio(calls, since, week):
-    """Studio's transcripts by week beside its own count per stage: the two need not match."""
+def load_studio_records(since, week):
     rows = defaultdict(lambda: defaultdict(int))
     for runs in studio_run_dirs():
         repo = short_name(project_of(runs[:-len("/.studio/runs")]))
@@ -333,6 +334,11 @@ def report_studio(calls, since, week):
                         row["stages"] += 1
                         for k in ("prompt_tokens", "cache_creation_tokens", "cached_input_tokens", "completion_tokens"):
                             row[k] += n.get(k) or 0
+    return rows
+
+
+def report_studio(calls, rows, week):
+    """Studio's transcripts by week beside its own count per stage: the two need not match."""
     sessions = defaultdict(list)
     for c in calls:
         if c["t"]["kind"] == "studio":
@@ -434,6 +440,7 @@ def main():
     p.add_argument("--sessions", action="store_true", help="also list each conversation")
     p.add_argument("--csv", metavar="PATH", help="write one row per transcript to PATH")
     p.add_argument("--json", metavar="PATH", help="write token counts per host, 5-minute bucket, cwd, model and kind to PATH")
+    p.add_argument("--studio-json", metavar="PATH", help="write Studio's own token counts per week, repo and model to PATH")
     args = p.parse_args()
 
     since = datetime.now(timezone.utc) - timedelta(weeks=args.weeks)
@@ -459,7 +466,8 @@ def main():
     report_background(calls)
     report_repos(calls, week)
     report_images(calls, week)
-    report_studio(calls, since, week)
+    studio_records = load_studio_records(since, week)
+    report_studio(calls, studio_records, week)
 
     if args.sessions:
         print("\n## Conversations\n")
@@ -478,6 +486,11 @@ def main():
         print(f"\nCSV: {len(transcripts)} rows written to {args.csv}")
     if args.json:
         print(f"\nJSON: {write_json(args.json, all_calls)} rows written to {args.json}")
+    if args.studio_json:
+        # Apart from --json: these calls can also be in the transcripts, so adding them up would count them twice.
+        with open(args.studio_json, "w", encoding="utf-8") as f:
+            json.dump([dict(zip(("week", "repo", "model"), k), **r) for k, r in sorted(studio_records.items())], f, indent=1)
+        print(f"\nStudio JSON: {len(studio_records)} rows written to {args.studio_json}")
 
     print(f"\nDedupe: {stats['read']} records read, {stats['dropped']} duplicates dropped, "
           f"{stats['changed']} keys whose last record differs from the first")
