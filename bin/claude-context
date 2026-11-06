@@ -139,6 +139,19 @@ def report_repos(rows):
             f"{fmt(total_in):>9}{total_in / grand * 100:>6.0f}%{fmt(sum(s['output'] for s in b)):>8}"
         )
 
+    weeks = sorted({f"{s['start']:%G-W%V}" for s in rows})
+    print("\n## Repo input by week\n")
+    print(f"{'repo':<36}" + "".join(f"{w:>10}" for w in weeks) + f"{'days used':>11}{'avg/day':>9}")
+    for repo, b in sorted(buckets.items(), key=lambda kv: -sum(s["input"] for s in kv[1])):
+        per_week = defaultdict(int)
+        for s in b:
+            per_week[f"{s['start']:%G-W%V}"] += s["input"]
+        days = len({s["start"].date() for s in b})
+        print(
+            f"{repo[:35]:<36}" + "".join(f"{fmt(per_week[w]) if per_week[w] else '-':>10}" for w in weeks)
+            + f"{days:>11}{fmt(sum(per_week.values()) / days):>9}"
+        )
+
 
 def write_csv(path, rows):
     fields = ["date", "week", "time", "kind", "title", "repo", "session_id", "calls", "start_ctx", "peak_ctx", "input", "cached", "output"]
