@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Context and token usage of every Claude Code session on this machine, by day and week.
 
-Usage: claude-context [--weeks N] [--reset ISO_DATETIME] [--sessions] [--csv PATH] [--json PATH]
+Usage: claude-context [--weeks N] [--reset ISO_DATETIME (default Sundays 18:00)] [--sessions] [--csv PATH] [--json PATH]
 """
 import argparse
 import csv
@@ -149,9 +149,6 @@ def load_all(since):
 
 
 def week_key(reset):
-    if reset is None:
-        return lambda c: f"{c['bucket']:%G-W%V}"
-
     def key(c):
         n = math.floor((c["bucket"] - reset) / timedelta(days=7))
         return f"{reset + timedelta(days=7 * (n + 1)):%Y-%m-%d}"
@@ -259,21 +256,23 @@ def write_json(path, calls):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--weeks", type=int, default=4)
-    p.add_argument("--reset", metavar="ISO_DATETIME", help="weekly windows of 7 days ending at this Montreal time")
+    p.add_argument(
+        "--reset", metavar="ISO_DATETIME", default="2026-01-04T18:00",
+        help="weekly windows of 7 days ending at this Montreal time (default: Sundays 18:00)",
+    )
     p.add_argument("--sessions", action="store_true", help="also list each conversation")
     p.add_argument("--csv", metavar="PATH", help="write one row per transcript to PATH")
     p.add_argument("--json", metavar="PATH", help="write token counts per host, 5-minute bucket, cwd, model and kind to PATH")
     args = p.parse_args()
 
     since = datetime.now(timezone.utc) - timedelta(weeks=args.weeks)
-    reset = datetime.fromisoformat(args.reset).replace(tzinfo=TZ) if args.reset else None
+    reset = datetime.fromisoformat(args.reset).replace(tzinfo=TZ)
     week = week_key(reset)
     calls, transcripts, stats = load_all(since)
 
     print(f"Claude Code sessions since {since.astimezone(TZ):%Y-%m-%d} (Montreal time)")
     print("background = conversation summaries and subagent warmups; start ctx = median first-call context of conversations")
-    if reset:
-        print(f"weeks end at {reset:%a %H:%M}, labelled by their end date")
+    print(f"weeks end at {reset:%a %H:%M}, labelled by their end date")
     report("By day", calls, lambda c: f"{c['bucket']:%Y-%m-%d}")
     report("By week", calls, week)
     report_background(calls)

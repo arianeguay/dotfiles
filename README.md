@@ -45,8 +45,8 @@ and by repo (worktrees count toward their repo). Each transcript is classed as a
 a subagent, or background work (conversation summaries and subagent warmups).
 
 ```
-claude-context                                  # last 4 weeks, by day, ISO week and repo
-claude-context --reset 2026-11-08T18:00         # weeks of 7 days ending Sunday 18:00
+claude-context                                  # last 4 weeks, by day, week (ending Sunday 18:00) and repo
+claude-context --reset 2026-11-09T01:59         # weeks of 7 days ending Monday 01:59 instead
 claude-context --weeks 2 --sessions             # also list each conversation by title
 claude-context --csv ~/context.csv              # one row per transcript, for a pivot table
 claude-context --json ~/context.json            # counts per host, bucket, cwd, model and kind
