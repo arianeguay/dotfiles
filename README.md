@@ -51,9 +51,10 @@ claude-context --reset 2026-11-09T01:59         # weeks of 7 days ending Monday 
 claude-context --weeks 2 --sessions             # also list each conversation by title
 claude-context --csv ~/context.csv              # one row per transcript, for a pivot table
 claude-context --json ~/context.json            # counts per host, bucket, cwd, model and kind
+claude-context --studio-json ~/studio.json      # Studio's own counts per week, repo and model
 ```
 
-The JSON holds counts only: no prompt text, titles or file content.
+Both JSON files hold counts only: no prompt text, titles or file content. Keep them apart: a Studio call can be in both.
 
 Reading the report:
 
