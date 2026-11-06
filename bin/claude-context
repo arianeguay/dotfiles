@@ -8,6 +8,7 @@ import csv
 import glob
 import json
 import os
+import re
 import statistics
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,16 @@ from zoneinfo import ZoneInfo
 TZ = ZoneInfo("America/Toronto")
 ROOT = os.path.expanduser("~/.claude/projects")
 KINDS = ("conversation", "subagent", "summarizer", "warmup")
+
+
+def repo_of(cwd):
+    if not cwd:
+        return "(unknown)"
+    path = re.sub(r"/\.(claude/)?worktrees/.*$", "", cwd)
+    # Sessions started by a program from a temp dir (e.g. an app driving the CLI), not by hand.
+    if re.match(r"/(private/)?var/folders/.*/T/[^/]+$", path):
+        return f"{os.path.basename(path)} (temp)"
+    return os.path.basename(path) or path
 
 
 def first_text(d):
@@ -33,7 +44,7 @@ def classify(d):
 
 
 def load(path, since):
-    kind, session_id, custom, ai = None, None, None, None
+    kind, session_id, custom, ai, cwd = None, None, None, None, None
     seen, calls = set(), []
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -48,6 +59,7 @@ def load(path, since):
                 ai = d.get("aiTitle")
             elif t == "user" and kind is None:
                 kind, session_id = classify(d), d.get("sessionId")
+            cwd = cwd or d.get("cwd")
             msg = d.get("message")
             u = msg.get("usage") if isinstance(msg, dict) else None
             rid = d.get("requestId") or d.get("uuid")
@@ -66,7 +78,7 @@ def load(path, since):
         "kind": kind or "conversation",
         "session_id": session_id,
         "title": custom or ai or "",
-        "project": os.path.relpath(path, ROOT).split(os.sep)[0],
+        "repo": repo_of(cwd),
         "calls": calls,
     }
 
@@ -112,14 +124,30 @@ def report(title, rows, key):
         )
 
 
+def report_repos(rows):
+    buckets = defaultdict(list)
+    for s in rows:
+        buckets[s["repo"]].append(s)
+    grand = sum(s["input"] for s in rows) or 1
+    print("\n## By repo\n")
+    print(f"{'repo':<36}{'convs':>6}{'subagents':>10}{'background':>11}{'input':>9}{'share':>7}{'output':>8}")
+    for repo, b in sorted(buckets.items(), key=lambda kv: -sum(s["input"] for s in kv[1])):
+        n = {kind: sum(s["kind"] == kind for s in b) for kind in KINDS}
+        total_in = sum(s["input"] for s in b)
+        print(
+            f"{repo[:35]:<36}{n['conversation']:>6}{n['subagent']:>10}{n['summarizer'] + n['warmup']:>11}"
+            f"{fmt(total_in):>9}{total_in / grand * 100:>6.0f}%{fmt(sum(s['output'] for s in b)):>8}"
+        )
+
+
 def write_csv(path, rows):
-    fields = ["date", "week", "time", "kind", "title", "project", "session_id", "calls", "start_ctx", "peak_ctx", "input", "cached", "output"]
+    fields = ["date", "week", "time", "kind", "title", "repo", "session_id", "calls", "start_ctx", "peak_ctx", "input", "cached", "output"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(fields)
         for s in sorted(rows, key=lambda s: s["start"]):
             w.writerow([
-                f"{s['start']:%Y-%m-%d}", f"{s['start']:%G-W%V}", f"{s['start']:%H:%M}", s["kind"], s["title"], s["project"],
+                f"{s['start']:%Y-%m-%d}", f"{s['start']:%G-W%V}", f"{s['start']:%H:%M}", s["kind"], s["title"], s["repo"],
                 s["session_id"], len(s["calls"]), s["start_ctx"], s["peak_ctx"], s["input"], s["cached"], s["output"],
             ])
 
@@ -138,6 +166,7 @@ def main():
     print("background = conversation summaries and subagent warmups; start ctx = median first-call context of conversations")
     report("By day", rows, lambda s: f"{s['start']:%Y-%m-%d}")
     report("By week", rows, lambda s: f"{s['start']:%G-W%V}")
+    report_repos(rows)
 
     if args.sessions:
         print("\n## Conversations\n")
@@ -148,7 +177,7 @@ def main():
         for s in sorted((s for s in rows if s["kind"] == "conversation"), key=lambda s: s["start"]):
             print(
                 f"{s['start']:%Y-%m-%d %H:%M}  {len(s['calls']):>4} calls  start {fmt(s['start_ctx']):>5}  peak {fmt(s['peak_ctx']):>5}"
-                f"  input {fmt(s['input']):>6}  subagents {fmt(subs[s['session_id']]):>6}  {s['title'] or '(untitled)'}"
+                f"  input {fmt(s['input']):>6}  subagents {fmt(subs[s['session_id']]):>6}  {s['repo'][:24]:<24}  {s['title'] or '(untitled)'}"
             )
 
     if args.csv:

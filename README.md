@@ -38,7 +38,8 @@ git -C ~/work/app config pull-all.target develop
 ## claude-context
 
 Context size and token usage of every Claude Code session on the machine, read from the
-transcripts in `~/.claude/projects`, by day and by ISO week in Montreal time. Each
+transcripts in `~/.claude/projects`, by day, by ISO week in Montreal time, and by repo
+(worktrees count toward their repo). Each
 transcript is classed as a conversation, a subagent, or background work (conversation
 summaries and subagent warmups), so the session counts are not inflated by the latter.
 
