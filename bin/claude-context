@@ -4,6 +4,7 @@
 Usage: claude-context [--weeks N] [--reset ISO_DATETIME (default Sundays 18:00)] [--sessions] [--csv PATH] [--json PATH]
 """
 import argparse
+import base64
 import csv
 import glob
 import json
@@ -12,6 +13,7 @@ import os
 import re
 import socket
 import statistics
+import struct
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -19,7 +21,7 @@ from zoneinfo import ZoneInfo
 TZ = ZoneInfo("America/Toronto")
 ROOT = os.path.expanduser("~/.claude/projects")
 HOST = socket.gethostname()
-KINDS = ("conversation", "subagent", "summarizer", "warmup")
+KINDS = ("conversation", "studio", "subagent", "summarizer", "warmup")
 TOKENS = ("fresh", "cache_write", "cache_write_5m", "cache_write_1h", "cache_read", "output")
 
 
@@ -47,7 +49,45 @@ def classify(d):
         return "warmup"
     if text.startswith("Context: This summary will be shown"):
         return "summarizer"
-    return "subagent" if d.get("isSidechain") else "conversation"
+    if d.get("isSidechain"):
+        return "subagent"
+    # Studio's Claude provider spawns the CLI with skip-permissions in the project's directory.
+    # Its entrypoint is inherited from the parent, so it cannot tell a Studio stage apart.
+    if d.get("cwd") and d.get("permissionMode") == "bypassPermissions" and os.path.isdir(os.path.join(project_of(d["cwd"]), ".studio")):
+        return "studio"
+    return "conversation"
+
+
+def image_size(b64):
+    raw = base64.b64decode(b64[:88000] + "=" * (-len(b64[:88000]) % 4))
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return struct.unpack(">II", raw[16:24])
+    i = 2
+    while raw[:2] == b"\xff\xd8" and i + 9 < len(raw):
+        if raw[i] != 0xFF:
+            i += 1
+        elif raw[i + 1] in (0xC0, 0xC1, 0xC2):
+            h, w = struct.unpack(">HH", raw[i + 5:i + 9])
+            return w, h
+        else:
+            i += 2 + struct.unpack(">H", raw[i + 2:i + 4])[0]
+    return None
+
+
+def image_tokens(content):
+    """Estimated tokens of each image in a message, tool results included: long edge 1568 px, then w*h/750."""
+    found = []
+    for block in content if isinstance(content, list) else []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_result":
+            found += image_tokens(block.get("content"))
+        elif block.get("type") == "image":
+            size = image_size((block.get("source") or {}).get("data") or "")
+            if size:
+                scale = min(1, 1568 / max(size))
+                found.append(int(size[0] * size[1] * scale * scale / 750))
+    return found
 
 
 def bucket_of(ts):
@@ -59,6 +99,8 @@ def load(path, since):
     t = {"kind": None, "session_id": None, "host": HOST}
     custom, ai, cwd = None, None, None
     records = []
+    # An image stays in the context, and is read back on each call, until a compaction drops it.
+    pending, carried, image_cost = [], 0, {}
     with open(path, encoding="utf-8") as f:
         for line in f:
             try:
@@ -74,15 +116,27 @@ def load(path, since):
                 t["kind"], t["session_id"] = classify(d), d.get("sessionId")
             cwd = cwd or d.get("cwd")
             msg = d.get("message")
+            if kind == "system" and d.get("subtype") == "compact_boundary":
+                pending, carried = [], 0
+            elif kind == "user" and isinstance(msg, dict):
+                pending += image_tokens(msg.get("content"))
             u = msg.get("usage") if isinstance(msg, dict) else None
             if not u or not d.get("timestamp"):
                 continue
+            key = (msg.get("id"), d.get("requestId")) if msg.get("id") or d.get("requestId") else (None, d.get("uuid"))
+            if key not in image_cost:
+                image_cost[key] = (len(pending), sum(pending), carried)
+                carried += sum(pending)
+                pending = []
             ts = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00"))
             if ts < since:
                 continue
             split = u.get("cache_creation") or {}
-            key = (msg.get("id"), d.get("requestId")) if msg.get("id") or d.get("requestId") else (None, d.get("uuid"))
+            image_count, image_new, image_read = image_cost[key]
             records.append((key, {
+                "image_count": image_count,
+                "image_new": image_new,
+                "image_read": image_read,
                 "ts": ts,
                 "bucket": bucket_of(ts),
                 "model": msg.get("model") or "",
@@ -160,10 +214,18 @@ def fmt(n):
 
 
 def token_cols(cs):
-    return "".join(f"{fmt(sum(c[k] for c in cs)):>9}" for k in ("fresh", "cache_write", "cache_read", "output"))
+    total = {k: sum(c[k] for c in cs) for k in TOKENS}
+    cols = (total["fresh"], total["cache_write"] - total["cache_write_1h"], total["cache_write_1h"], total["cache_read"], total["output"])
+    return "".join(f"{fmt(n):>9}" for n in cols)
 
 
-TOKEN_HEADER = f"{'fresh':>9}{'write':>9}{'read':>9}{'output':>9}"
+TOKEN_HEADER = f"{'fresh':>9}{'w5m':>9}{'w1h':>9}{'read':>9}{'output':>9}"
+
+
+def weight(c):
+    """Public prices relative to fresh input. The limit's formula is not public, so this only compares periods."""
+    w1h = c["cache_write_1h"]
+    return c["fresh"] + 0.1 * c["cache_read"] + 1.25 * (c["cache_write"] - w1h) + 2 * w1h + 5 * c["output"]
 
 
 def counts(cs):
@@ -179,14 +241,102 @@ def report(title, calls, key):
         buckets[key(c)].append(c)
     convs = [c["t"] for c in calls if c["t"]["kind"] == "conversation" and c is c["t"]["calls"][0]]
     print(f"\n## {title}\n")
-    print(f"{'period':<12}{'convs':>6}{'subagents':>10}{'background':>11}{'start ctx':>11}{'peak ctx':>10}" + TOKEN_HEADER)
+    print(f"{'period':<12}{'convs':>6}{'studio':>7}{'subagents':>10}{'background':>11}{'start ctx':>11}{'peak ctx':>10}" + TOKEN_HEADER)
     for k in sorted(buckets):
         b = buckets[k]
         n = counts(b)
         starts = [t["start_ctx"] for t in convs if key(t["calls"][0]) == k]
         print(
-            f"{k:<12}{n['conversation']:>6}{n['subagent']:>10}{n['summarizer'] + n['warmup']:>11}"
+            f"{k:<12}{n['conversation']:>6}{n['studio']:>7}{n['subagent']:>10}{n['summarizer'] + n['warmup']:>11}"
             f"{fmt(statistics.median(starts)) if starts else '-':>11}{fmt(max(ctx(c) for c in b)):>10}" + token_cols(b)
+        )
+
+
+def report_pace(calls, reset, since):
+    """A week still running only compares with past weeks cut at the same elapsed time."""
+    now = datetime.now(TZ)
+    start = reset + timedelta(days=7 * math.floor((now - reset) / timedelta(days=7)))
+    elapsed = now - start
+    print(f"\n## Pace: each week's first {elapsed.days}d {elapsed.seconds // 3600}h\n")
+    print(f"{'week ending':<12}{'calls':>7}" + TOKEN_HEADER + f"{'weight':>9}")
+    while start >= since:
+        cs = [c for c in calls if start <= c["bucket"] < start + elapsed]
+        print(f"{start + timedelta(days=7):%Y-%m-%d}  {len(cs):>7}" + token_cols(cs) + f"{fmt(sum(map(weight, cs))):>9}")
+        start -= timedelta(days=7)
+    print("weight = fresh + read x 0.1 + w5m x 1.25 + w1h x 2 + output x 5: public prices, the limit's formula is not public")
+
+
+def report_models(calls, week):
+    buckets = defaultdict(list)
+    for c in calls:
+        buckets[(week(c), c["model"])].append(c)
+    print("\n## By model and week\n")
+    print(f"{'week ending':<12}{'model':<28}{'calls':>7}" + TOKEN_HEADER + f"{'weight':>9}")
+    for (w, model), cs in sorted(buckets.items(), key=lambda kv: (kv[0][0], -sum(map(weight, kv[1])))):
+        print(f"{w:<12}{model[:27]:<28}{len(cs):>7}" + token_cols(cs) + f"{fmt(sum(map(weight, cs))):>9}")
+
+
+def report_images(calls, week):
+    total = sum(c["image_count"] for c in calls)
+    if not total:
+        return
+    print("\n## Images (estimated tokens: width x height / 750)\n")
+    print(f"{'':<36}{'images':>7}{'sent':>9}{'read back':>11}{'of writes':>11}{'of reads':>10}")
+    weeks, repos = defaultdict(list), defaultdict(list)
+    for c in calls:
+        weeks[week(c)].append(c)
+        repos[c["t"]["repo"]].append(c)
+    top = sorted(repos.items(), key=lambda kv: -sum(c["image_read"] for c in kv[1]))[:5]
+    for label, cs in sorted(weeks.items()) + top:
+        new, back = sum(c["image_new"] for c in cs), sum(c["image_read"] for c in cs)
+        if not new and not back:
+            continue
+        print(
+            f"{label[:35]:<36}{sum(c['image_count'] for c in cs):>7}{fmt(new):>9}{fmt(back):>11}"
+            f"{new / (sum(c['cache_write'] for c in cs) or 1) * 100:>10.1f}%{back / (sum(c['cache_read'] for c in cs) or 1) * 100:>9.1f}%"
+        )
+
+
+def studio_run_dirs():
+    for root in ("~/dev", "~/src"):
+        for path, dirs, _ in os.walk(os.path.expanduser(root)):
+            if path.endswith("/.studio") and "runs" in dirs:
+                yield os.path.join(path, "runs")
+            dirs[:] = [x for x in dirs if x != "node_modules" and (not x.startswith(".") or x in (".studio", ".worktrees"))]
+
+
+def report_studio_records(since, week):
+    """Studio's own count per stage, for comparison with its transcripts: the two need not match."""
+    rows = defaultdict(lambda: defaultdict(int))
+    for runs in studio_run_dirs():
+        repo = short_name(project_of(runs[:-len("/.studio/runs")]))
+        for path in glob.glob(f"{runs}/*.jsonl"):
+            if datetime.fromtimestamp(os.path.getmtime(path), timezone.utc) < since:
+                continue
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        e = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(e, dict) or e.get("event") != "stage_complete" or not e.get("ts"):
+                        continue
+                    ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+                    if ts < since:
+                        continue
+                    for model, n in ((e.get("tokens") or {}).get("by_model") or {}).items():
+                        row = rows[(week({"bucket": bucket_of(ts)}), repo, model)]
+                        row["stages"] += 1
+                        for k in ("prompt_tokens", "cache_creation_tokens", "cached_input_tokens", "completion_tokens"):
+                            row[k] += n.get(k) or 0
+    if not rows:
+        return
+    print("\n## Studio's own records, by stage\n")
+    print(f"{'week ending':<12}{'repo':<24}{'model':<28}{'stages':>7}{'prompt':>9}{'write':>9}{'read':>9}{'output':>9}")
+    for (w, repo, model), r in sorted(rows.items(), key=lambda kv: (kv[0][0], -kv[1]["cache_creation_tokens"])):
+        print(
+            f"{w:<12}{repo[:23]:<24}{model[:27]:<28}{r['stages']:>7}{fmt(r['prompt_tokens']):>9}"
+            f"{fmt(r['cache_creation_tokens']):>9}{fmt(r['cached_input_tokens']):>9}{fmt(r['completion_tokens']):>9}"
         )
 
 
@@ -205,11 +355,11 @@ def report_repos(calls, week):
     order = sorted(buckets.items(), key=lambda kv: -sum(ctx(c) for c in kv[1]))
     grand = sum(ctx(c) for c in calls) or 1
     print("\n## By repo\n")
-    print(f"{'repo':<36}{'convs':>6}{'subagents':>10}{'background':>11}" + TOKEN_HEADER + f"{'share':>7}")
+    print(f"{'repo':<36}{'convs':>6}{'studio':>7}{'subagents':>10}{'background':>11}" + TOKEN_HEADER + f"{'share':>7}")
     for repo, b in order:
         n = counts(b)
         print(
-            f"{repo[:35]:<36}{n['conversation']:>6}{n['subagent']:>10}{n['summarizer'] + n['warmup']:>11}"
+            f"{repo[:35]:<36}{n['conversation']:>6}{n['studio']:>7}{n['subagent']:>10}{n['summarizer'] + n['warmup']:>11}"
             + token_cols(b) + f"{sum(ctx(c) for c in b) / grand * 100:>6.0f}%"
         )
 
@@ -268,15 +418,27 @@ def main():
     since = datetime.now(timezone.utc) - timedelta(weeks=args.weeks)
     reset = datetime.fromisoformat(args.reset).replace(tzinfo=TZ)
     week = week_key(reset)
-    calls, transcripts, stats = load_all(since)
+    all_calls, transcripts, stats = load_all(since)
+    # A local model reached through ANTHROPIC_BASE_URL is in the transcripts but not on the Claude limit.
+    calls = [c for c in all_calls if c["model"].startswith("claude-")]
+    left_out = defaultdict(int)
+    for c in all_calls:
+        if not c["model"].startswith("claude-"):
+            left_out[c["model"] or "(none)"] += 1
 
     print(f"Claude Code sessions since {since.astimezone(TZ):%Y-%m-%d} (Montreal time)")
     print("background = conversation summaries and subagent warmups; start ctx = median first-call context of conversations")
     print(f"weeks end at {reset:%a %H:%M}, labelled by their end date")
+    if left_out:
+        print("left out, not Claude: " + ", ".join(f"{m} ({n} calls)" for m, n in sorted(left_out.items())))
     report("By day", calls, lambda c: f"{c['bucket']:%Y-%m-%d}")
     report("By week", calls, week)
+    report_pace(calls, reset, since)
+    report_models(calls, week)
     report_background(calls)
     report_repos(calls, week)
+    report_images(calls, week)
+    report_studio_records(since, week)
 
     if args.sessions:
         print("\n## Conversations\n")
@@ -294,7 +456,7 @@ def main():
         write_csv(args.csv, transcripts, week)
         print(f"\nCSV: {len(transcripts)} rows written to {args.csv}")
     if args.json:
-        print(f"\nJSON: {write_json(args.json, calls)} rows written to {args.json}")
+        print(f"\nJSON: {write_json(args.json, all_calls)} rows written to {args.json}")
 
     print(f"\nDedupe: {stats['read']} records read, {stats['dropped']} duplicates dropped, "
           f"{stats['changed']} keys whose last record differs from the first")
