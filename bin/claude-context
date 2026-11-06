@@ -51,9 +51,9 @@ def classify(d):
         return "summarizer"
     if d.get("isSidechain"):
         return "subagent"
-    # Studio's Claude provider spawns the CLI with skip-permissions in the project's directory.
-    # Its entrypoint is inherited from the parent, so it cannot tell a Studio stage apart.
-    if d.get("cwd") and d.get("permissionMode") == "bypassPermissions" and os.path.isdir(os.path.join(project_of(d["cwd"]), ".studio")):
+    # Studio's Claude provider spawns the CLI with skip-permissions; nothing else here does (measured on every host,
+    # 2026-11-06). Its entrypoint is inherited, and its cwd can exist only inside a container, like skynet-counter's /app.
+    if d.get("permissionMode") == "bypassPermissions":
         return "studio"
     return "conversation"
 
@@ -300,13 +300,15 @@ def report_images(calls, week):
 def studio_run_dirs():
     # A checkout's runs directory can be a link to a worktree's, so one directory has two paths.
     seen = set()
-    for root in ("~/dev", "~/src"):
-        for path, dirs, _ in os.walk(os.path.expanduser(root)):
-            runs = os.path.join(path, "runs")
-            if path.endswith("/.studio") and "runs" in dirs and os.path.realpath(runs) not in seen:
-                seen.add(os.path.realpath(runs))
-                yield runs
-            dirs[:] = [x for x in dirs if x != "node_modules" and (not x.startswith(".") or x in (".studio", ".worktrees"))]
+    home = os.path.expanduser("~")
+    for path, dirs, _ in os.walk(home):
+        runs = os.path.join(path, "runs")
+        if path.endswith("/.studio") and "runs" in dirs and os.path.realpath(runs) not in seen:
+            seen.add(os.path.realpath(runs))
+            yield runs
+        if path[len(home):].count("/") >= 10:
+            dirs[:] = []
+        dirs[:] = [x for x in dirs if x != "node_modules" and (not x.startswith(".") or x in (".studio", ".worktrees"))]
 
 
 def load_studio_records(since, week):
