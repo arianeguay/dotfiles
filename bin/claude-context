@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Context and token usage of every Claude Code session on this machine, by day and week.
 
-Usage: claude-context [--weeks N] [--sessions] [--csv PATH]
+Usage: claude-context [--weeks N] [--reset ISO_DATETIME] [--sessions] [--csv PATH] [--json PATH]
 """
 import argparse
 import csv
 import glob
 import json
+import math
 import os
 import re
+import socket
 import statistics
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -16,13 +18,18 @@ from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("America/Toronto")
 ROOT = os.path.expanduser("~/.claude/projects")
+HOST = socket.gethostname()
 KINDS = ("conversation", "subagent", "summarizer", "warmup")
+TOKENS = ("fresh", "cache_write", "cache_write_5m", "cache_write_1h", "cache_read", "output")
 
 
-def repo_of(cwd):
-    if not cwd:
+def project_of(cwd):
+    return re.sub(r"/\.(claude/)?worktrees/.*$", "", cwd) if cwd else ""
+
+
+def short_name(path):
+    if not path:
         return "(unknown)"
-    path = re.sub(r"/\.(claude/)?worktrees/.*$", "", cwd)
     # Sessions started by a program from a temp dir (e.g. an app driving the CLI), not by hand.
     if re.match(r"/(private/)?var/folders/.*/T/[^/]+$", path):
         return f"{os.path.basename(path)} (temp)"
@@ -43,159 +50,255 @@ def classify(d):
     return "subagent" if d.get("isSidechain") else "conversation"
 
 
+def bucket_of(ts):
+    local = ts.astimezone(TZ)
+    return local.replace(minute=local.minute - local.minute % 5, second=0, microsecond=0)
+
+
 def load(path, since):
-    kind, session_id, custom, ai, cwd = None, None, None, None, None
-    seen, calls = set(), []
+    t = {"kind": None, "session_id": None, "host": HOST}
+    custom, ai, cwd = None, None, None
+    records = []
     with open(path, encoding="utf-8") as f:
         for line in f:
             try:
                 d = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            t = d.get("type")
-            if t == "custom-title":
+            kind = d.get("type")
+            if kind == "custom-title":
                 custom = d.get("customTitle")
-            elif t == "ai-title":
+            elif kind == "ai-title":
                 ai = d.get("aiTitle")
-            elif t == "user" and kind is None:
-                kind, session_id = classify(d), d.get("sessionId")
+            elif kind == "user" and t["kind"] is None:
+                t["kind"], t["session_id"] = classify(d), d.get("sessionId")
             cwd = cwd or d.get("cwd")
             msg = d.get("message")
             u = msg.get("usage") if isinstance(msg, dict) else None
-            rid = d.get("requestId") or d.get("uuid")
-            if not u or rid in seen or not d.get("timestamp"):
+            if not u or not d.get("timestamp"):
                 continue
-            seen.add(rid)
             ts = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00"))
             if ts < since:
                 continue
-            ctx = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + u.get("cache_read_input_tokens", 0)
-            calls.append((ts, ctx, u.get("cache_read_input_tokens", 0), u.get("output_tokens", 0)))
-    if not calls:
-        return None
-    calls.sort()
-    return {
-        "kind": kind or "conversation",
-        "session_id": session_id,
-        "title": custom or ai or "",
-        "repo": repo_of(cwd),
-        "calls": calls,
-    }
+            split = u.get("cache_creation") or {}
+            key = (msg.get("id"), d.get("requestId")) if msg.get("id") or d.get("requestId") else (None, d.get("uuid"))
+            records.append((key, {
+                "ts": ts,
+                "bucket": bucket_of(ts),
+                "model": msg.get("model") or "",
+                "fresh": u.get("input_tokens", 0),
+                "cache_write": u.get("cache_creation_input_tokens", 0),
+                "cache_write_5m": split.get("ephemeral_5m_input_tokens", 0),
+                "cache_write_1h": split.get("ephemeral_1h_input_tokens", 0),
+                "cache_read": u.get("cache_read_input_tokens", 0),
+                "output": u.get("output_tokens", 0),
+                "t": t,
+            }))
+    t["kind"] = t["kind"] or "conversation"
+    t["title"] = custom or ai or ""
+    t["cwd"] = project_of(cwd)
+    t["repo"] = short_name(t["cwd"])
+    return t, records
+
+
+def ctx(c):
+    return c["fresh"] + c["cache_write"] + c["cache_read"]
+
+
+def fingerprint(c):
+    return (c["model"],) + tuple(c[k] for k in TOKENS)
 
 
 def load_all(since):
-    rows = []
-    for path in glob.glob(f"{ROOT}/**/*.jsonl", recursive=True):
-        if datetime.fromtimestamp(os.path.getmtime(path), timezone.utc) >= since and (s := load(path, since)):
-            rows.append(s)
-    titles = {s["session_id"]: s["title"] for s in rows if s["kind"] == "conversation" and s["title"]}
-    for s in rows:
-        s["title"] = s["title"] or titles.get(s["session_id"], "")
-        c = s["calls"]
-        s["start"] = c[0][0].astimezone(TZ)
-        s["start_ctx"] = c[0][1]
-        s["peak_ctx"] = max(x[1] for x in c)
-        s["input"] = sum(x[1] for x in c)
-        s["cached"] = sum(x[2] for x in c)
-        s["output"] = sum(x[3] for x in c)
-    return rows
+    paths = sorted(
+        (p for p in glob.glob(f"{ROOT}/**/*.jsonl", recursive=True)
+         if datetime.fromtimestamp(os.path.getmtime(p), timezone.utc) >= since),
+        key=os.path.getmtime,
+    )
+    # Last record wins: streaming records can carry placeholder counts, and a resumed
+    # session can repeat earlier messages in a newer transcript.
+    calls, first, read = {}, {}, 0
+    for path in paths:
+        _, records = load(path, since)
+        for key, c in records:
+            read += 1
+            first.setdefault(key, c)
+            calls[key] = c
+    changed = sum(fingerprint(first[k]) != fingerprint(c) for k, c in calls.items())
+    stats = {"read": read, "dropped": read - len(calls), "changed": changed}
+
+    by_t = defaultdict(list)
+    for c in calls.values():
+        by_t[id(c["t"])].append(c)
+    transcripts = []
+    for cs in by_t.values():
+        cs.sort(key=lambda c: c["ts"])
+        t = cs[0]["t"]
+        t["calls"] = cs
+        t["start"] = cs[0]["bucket"]
+        t["start_ctx"] = ctx(cs[0])
+        t["peak_ctx"] = max(ctx(c) for c in cs)
+        for k in TOKENS:
+            t[k] = sum(c[k] for c in cs)
+        t["input"] = ctx(t)
+        transcripts.append(t)
+    titles = {t["session_id"]: t["title"] for t in transcripts if t["kind"] == "conversation" and t["title"]}
+    for t in transcripts:
+        t["title"] = t["title"] or titles.get(t["session_id"], "")
+    return list(calls.values()), transcripts, stats
+
+
+def week_key(reset):
+    if reset is None:
+        return lambda c: f"{c['bucket']:%G-W%V}"
+
+    def key(c):
+        n = math.floor((c["bucket"] - reset) / timedelta(days=7))
+        return f"{reset + timedelta(days=7 * (n + 1)):%Y-%m-%d}"
+    return key
 
 
 def fmt(n):
     return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}k"
 
 
-def report(title, rows, key):
+def token_cols(cs):
+    return "".join(f"{fmt(sum(c[k] for c in cs)):>9}" for k in ("fresh", "cache_write", "cache_read", "output"))
+
+
+TOKEN_HEADER = f"{'fresh':>9}{'write':>9}{'read':>9}{'output':>9}"
+
+
+def counts(cs):
+    n = defaultdict(set)
+    for c in cs:
+        n[c["t"]["kind"]].add(id(c["t"]))
+    return {kind: len(n[kind]) for kind in KINDS}
+
+
+def report(title, calls, key):
     buckets = defaultdict(list)
-    for s in rows:
-        buckets[key(s)].append(s)
+    for c in calls:
+        buckets[key(c)].append(c)
+    convs = [c["t"] for c in calls if c["t"]["kind"] == "conversation" and c is c["t"]["calls"][0]]
     print(f"\n## {title}\n")
-    print(f"{'period':<12}{'convs':>6}{'subagents':>10}{'background':>11}{'start ctx':>11}{'peak ctx':>10}{'input':>9}{'cached %':>9}{'output':>8}")
+    print(f"{'period':<12}{'convs':>6}{'subagents':>10}{'background':>11}{'start ctx':>11}{'peak ctx':>10}" + TOKEN_HEADER)
     for k in sorted(buckets):
         b = buckets[k]
-        n = {kind: sum(s["kind"] == kind for s in b) for kind in KINDS}
-        starts = [s["start_ctx"] for s in b if s["kind"] == "conversation"] or [0]
-        total_in = sum(s["input"] for s in b)
-        cached = sum(s["cached"] for s in b)
+        n = counts(b)
+        starts = [t["start_ctx"] for t in convs if key(t["calls"][0]) == k]
         print(
             f"{k:<12}{n['conversation']:>6}{n['subagent']:>10}{n['summarizer'] + n['warmup']:>11}"
-            f"{fmt(statistics.median(starts)):>11}{fmt(max(s['peak_ctx'] for s in b)):>10}"
-            f"{fmt(total_in):>9}{cached / total_in * 100 if total_in else 0:>8.0f}%{fmt(sum(s['output'] for s in b)):>8}"
+            f"{fmt(statistics.median(starts)) if starts else '-':>11}{fmt(max(ctx(c) for c in b)):>10}" + token_cols(b)
         )
 
 
-def report_repos(rows):
+def report_background(calls):
+    print("\n## Background\n")
+    print(f"{'kind':<12}{'transcripts':>12}{'calls':>7}" + TOKEN_HEADER)
+    for kind in ("summarizer", "warmup"):
+        cs = [c for c in calls if c["t"]["kind"] == kind]
+        print(f"{kind:<12}{len({id(c['t']) for c in cs}):>12}{len(cs):>7}" + token_cols(cs))
+
+
+def report_repos(calls, week):
     buckets = defaultdict(list)
-    for s in rows:
-        buckets[s["repo"]].append(s)
-    grand = sum(s["input"] for s in rows) or 1
+    for c in calls:
+        buckets[c["t"]["repo"]].append(c)
+    order = sorted(buckets.items(), key=lambda kv: -sum(ctx(c) for c in kv[1]))
+    grand = sum(ctx(c) for c in calls) or 1
     print("\n## By repo\n")
-    print(f"{'repo':<36}{'convs':>6}{'subagents':>10}{'background':>11}{'input':>9}{'share':>7}{'output':>8}")
-    for repo, b in sorted(buckets.items(), key=lambda kv: -sum(s["input"] for s in kv[1])):
-        n = {kind: sum(s["kind"] == kind for s in b) for kind in KINDS}
-        total_in = sum(s["input"] for s in b)
+    print(f"{'repo':<36}{'convs':>6}{'subagents':>10}{'background':>11}" + TOKEN_HEADER + f"{'share':>7}")
+    for repo, b in order:
+        n = counts(b)
         print(
             f"{repo[:35]:<36}{n['conversation']:>6}{n['subagent']:>10}{n['summarizer'] + n['warmup']:>11}"
-            f"{fmt(total_in):>9}{total_in / grand * 100:>6.0f}%{fmt(sum(s['output'] for s in b)):>8}"
+            + token_cols(b) + f"{sum(ctx(c) for c in b) / grand * 100:>6.0f}%"
         )
 
-    weeks = sorted({f"{s['start']:%G-W%V}" for s in rows})
-    print("\n## Repo input by week\n")
-    print(f"{'repo':<36}" + "".join(f"{w:>10}" for w in weeks) + f"{'days used':>11}{'avg/day':>9}")
-    for repo, b in sorted(buckets.items(), key=lambda kv: -sum(s["input"] for s in kv[1])):
+    weeks = sorted({week(c) for c in calls})
+    print("\n## Repo input by week (fresh + write + read)\n")
+    print(f"{'repo':<36}" + "".join(f"{w:>12}" for w in weeks) + f"{'days used':>11}{'avg/day':>9}")
+    for repo, b in order:
         per_week = defaultdict(int)
-        for s in b:
-            per_week[f"{s['start']:%G-W%V}"] += s["input"]
-        days = len({s["start"].date() for s in b})
+        for c in b:
+            per_week[week(c)] += ctx(c)
+        days = len({c["bucket"].date() for c in b})
         print(
-            f"{repo[:35]:<36}" + "".join(f"{fmt(per_week[w]) if per_week[w] else '-':>10}" for w in weeks)
+            f"{repo[:35]:<36}" + "".join(f"{fmt(per_week[w]) if per_week[w] else '-':>12}" for w in weeks)
             + f"{days:>11}{fmt(sum(per_week.values()) / days):>9}"
         )
 
 
-def write_csv(path, rows):
-    fields = ["date", "week", "time", "kind", "title", "repo", "session_id", "calls", "start_ctx", "peak_ctx", "input", "cached", "output"]
+def write_csv(path, transcripts, week):
+    fields = ["date", "week", "time", "kind", "title", "host", "cwd", "session_id", "calls", "start_ctx", "peak_ctx", *TOKENS]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(fields)
-        for s in sorted(rows, key=lambda s: s["start"]):
+        for t in sorted(transcripts, key=lambda t: t["start"]):
             w.writerow([
-                f"{s['start']:%Y-%m-%d}", f"{s['start']:%G-W%V}", f"{s['start']:%H:%M}", s["kind"], s["title"], s["repo"],
-                s["session_id"], len(s["calls"]), s["start_ctx"], s["peak_ctx"], s["input"], s["cached"], s["output"],
+                f"{t['start']:%Y-%m-%d}", week(t["calls"][0]), f"{t['start']:%H:%M}", t["kind"], t["title"], t["host"], t["cwd"],
+                t["session_id"], len(t["calls"]), t["start_ctx"], t["peak_ctx"], *(t[k] for k in TOKENS),
             ])
+
+
+def write_json(path, calls):
+    rows = {}
+    for c in calls:
+        t = c["t"]
+        key = (t["host"], c["bucket"].isoformat(), t["cwd"], c["model"], t["kind"])
+        row = rows.setdefault(key, dict(zip(("host", "bucket", "cwd", "model", "kind"), key), calls=0, **dict.fromkeys(TOKENS, 0)))
+        row["calls"] += 1
+        for k in TOKENS:
+            row[k] += c[k]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(sorted(rows.values(), key=lambda r: r["bucket"]), f, indent=1)
+    return len(rows)
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--weeks", type=int, default=4)
+    p.add_argument("--reset", metavar="ISO_DATETIME", help="weekly windows of 7 days ending at this Montreal time")
     p.add_argument("--sessions", action="store_true", help="also list each conversation")
     p.add_argument("--csv", metavar="PATH", help="write one row per transcript to PATH")
+    p.add_argument("--json", metavar="PATH", help="write token counts per host, 5-minute bucket, cwd, model and kind to PATH")
     args = p.parse_args()
 
     since = datetime.now(timezone.utc) - timedelta(weeks=args.weeks)
-    rows = load_all(since)
+    reset = datetime.fromisoformat(args.reset).replace(tzinfo=TZ) if args.reset else None
+    week = week_key(reset)
+    calls, transcripts, stats = load_all(since)
 
     print(f"Claude Code sessions since {since.astimezone(TZ):%Y-%m-%d} (Montreal time)")
     print("background = conversation summaries and subagent warmups; start ctx = median first-call context of conversations")
-    report("By day", rows, lambda s: f"{s['start']:%Y-%m-%d}")
-    report("By week", rows, lambda s: f"{s['start']:%G-W%V}")
-    report_repos(rows)
+    if reset:
+        print(f"weeks end at {reset:%a %H:%M}, labelled by their end date")
+    report("By day", calls, lambda c: f"{c['bucket']:%Y-%m-%d}")
+    report("By week", calls, week)
+    report_background(calls)
+    report_repos(calls, week)
 
     if args.sessions:
         print("\n## Conversations\n")
         subs = defaultdict(int)
-        for s in rows:
-            if s["kind"] == "subagent":
-                subs[s["session_id"]] += s["input"]
-        for s in sorted((s for s in rows if s["kind"] == "conversation"), key=lambda s: s["start"]):
+        for t in transcripts:
+            if t["kind"] == "subagent":
+                subs[t["session_id"]] += t["input"]
+        for t in sorted((t for t in transcripts if t["kind"] == "conversation"), key=lambda t: t["start"]):
             print(
-                f"{s['start']:%Y-%m-%d %H:%M}  {len(s['calls']):>4} calls  start {fmt(s['start_ctx']):>5}  peak {fmt(s['peak_ctx']):>5}"
-                f"  input {fmt(s['input']):>6}  subagents {fmt(subs[s['session_id']]):>6}  {s['repo'][:24]:<24}  {s['title'] or '(untitled)'}"
+                f"{t['start']:%Y-%m-%d %H:%M}  {len(t['calls']):>4} calls  start {fmt(t['start_ctx']):>5}  peak {fmt(t['peak_ctx']):>5}"
+                f"  input {fmt(t['input']):>6}  subagents {fmt(subs[t['session_id']]):>6}  {t['repo'][:24]:<24}  {t['title'] or '(untitled)'}"
             )
 
     if args.csv:
-        write_csv(args.csv, rows)
-        print(f"\nCSV: {len(rows)} rows written to {args.csv}")
+        write_csv(args.csv, transcripts, week)
+        print(f"\nCSV: {len(transcripts)} rows written to {args.csv}")
+    if args.json:
+        print(f"\nJSON: {write_json(args.json, calls)} rows written to {args.json}")
+
+    print(f"\nDedupe: {stats['read']} records read, {stats['dropped']} duplicates dropped, "
+          f"{stats['changed']} keys whose last record differs from the first")
 
 
 if __name__ == "__main__":

@@ -38,14 +38,18 @@ git -C ~/work/app config pull-all.target develop
 ## claude-context
 
 Context size and token usage of every Claude Code session on the machine, read from the
-transcripts in `~/.claude/projects`, by day, by ISO week in Montreal time, and by repo
-(worktrees count toward their repo), with each repo's input per week and per day it was
-used. Each
-transcript is classed as a conversation, a subagent, or background work (conversation
-summaries and subagent warmups), so the session counts are not inflated by the latter.
+transcripts in `~/.claude/projects`. Tokens are split into fresh input, cache write, cache
+read and output, and each API call is counted once (the last record per message and request,
+across transcripts) on its own 5-minute bucket, in Montreal time. Reported by day, by week,
+and by repo (worktrees count toward their repo). Each transcript is classed as a conversation,
+a subagent, or background work (conversation summaries and subagent warmups).
 
 ```
-claude-context                       # last 4 weeks, by day and week
-claude-context --weeks 2 --sessions  # also list each conversation by title
-claude-context --csv ~/context.csv   # one row per transcript, for a pivot table
+claude-context                                  # last 4 weeks, by day, ISO week and repo
+claude-context --reset 2026-11-08T18:00         # weeks of 7 days ending Sunday 18:00
+claude-context --weeks 2 --sessions             # also list each conversation by title
+claude-context --csv ~/context.csv              # one row per transcript, for a pivot table
+claude-context --json ~/context.json            # counts per host, bucket, cwd, model and kind
 ```
+
+The JSON holds counts only: no prompt text, titles or file content.
