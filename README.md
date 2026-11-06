@@ -54,3 +54,12 @@ claude-context --json ~/context.json            # counts per host, bucket, cwd, 
 ```
 
 The JSON holds counts only: no prompt text, titles or file content.
+
+Reading the report:
+
+- **Pace** cuts every week at the time elapsed in the current one. Comparing a running week to a full one always makes it look low.
+- **Weight** applies public prices to compare periods. The limit's real formula is not public.
+- **w5m and w1h** are cache writes by lifetime. Only Claude models count: a local model reached through `ANTHROPIC_BASE_URL` is named and left out of the tables.
+- **studio** counts sessions Studio's Claude provider spawned, which otherwise read as conversations under the parent's entrypoint.
+- **Images** are estimated as width x height / 750. They are read back on each call until a compaction, which costs far more than sending them once. On one repo the real context jump ran about 1.22 times this estimate.
+- **Studio's own records** come from `.studio/runs` under `~/dev` and `~/src`. They can exceed the transcripts: on 2026-11-06, 454 Haiku stages left no transcript at all, so a repo using Studio is undercounted above.
