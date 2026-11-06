@@ -298,15 +298,19 @@ def report_images(calls, week):
 
 
 def studio_run_dirs():
+    # A checkout's runs directory can be a link to a worktree's, so one directory has two paths.
+    seen = set()
     for root in ("~/dev", "~/src"):
         for path, dirs, _ in os.walk(os.path.expanduser(root)):
-            if path.endswith("/.studio") and "runs" in dirs:
-                yield os.path.join(path, "runs")
+            runs = os.path.join(path, "runs")
+            if path.endswith("/.studio") and "runs" in dirs and os.path.realpath(runs) not in seen:
+                seen.add(os.path.realpath(runs))
+                yield runs
             dirs[:] = [x for x in dirs if x != "node_modules" and (not x.startswith(".") or x in (".studio", ".worktrees"))]
 
 
-def report_studio_records(since, week):
-    """Studio's own count per stage, for comparison with its transcripts: the two need not match."""
+def report_studio(calls, since, week):
+    """Studio's transcripts by week beside its own count per stage: the two need not match."""
     rows = defaultdict(lambda: defaultdict(int))
     for runs in studio_run_dirs():
         repo = short_name(project_of(runs[:-len("/.studio/runs")]))
@@ -329,8 +333,25 @@ def report_studio_records(since, week):
                         row["stages"] += 1
                         for k in ("prompt_tokens", "cache_creation_tokens", "cached_input_tokens", "completion_tokens"):
                             row[k] += n.get(k) or 0
-    if not rows:
+    sessions = defaultdict(list)
+    for c in calls:
+        if c["t"]["kind"] == "studio":
+            sessions[week(c)].append(c)
+    records = defaultdict(lambda: defaultdict(int))
+    for (w, _, model), r in rows.items():
+        if model.startswith("claude-"):
+            for k, v in r.items():
+                records[w][k] += v
+    if not sessions and not records:
         return
+    print("\n## Studio by week: transcripts, then Studio's own records of Claude models\n")
+    print(f"{'week ending':<12}{'calls':>7}" + TOKEN_HEADER + f"{'weight':>9}  |{'entries':>8}{'prompt':>9}{'write':>9}{'read':>9}{'output':>9}")
+    for w in sorted(set(sessions) | set(records)):
+        cs, r = sessions[w], records[w]
+        print(
+            f"{w:<12}{len(cs):>7}" + token_cols(cs) + f"{fmt(sum(map(weight, cs))):>9}  |{r['stages']:>8}{fmt(r['prompt_tokens']):>9}"
+            f"{fmt(r['cache_creation_tokens']):>9}{fmt(r['cached_input_tokens']):>9}{fmt(r['completion_tokens']):>9}"
+        )
     print("\n## Studio's own records, by stage\n")
     print(f"{'week ending':<12}{'repo':<24}{'model':<28}{'stages':>7}{'prompt':>9}{'write':>9}{'read':>9}{'output':>9}")
     for (w, repo, model), r in sorted(rows.items(), key=lambda kv: (kv[0][0], -kv[1]["cache_creation_tokens"])):
@@ -438,7 +459,7 @@ def main():
     report_background(calls)
     report_repos(calls, week)
     report_images(calls, week)
-    report_studio_records(since, week)
+    report_studio(calls, since, week)
 
     if args.sessions:
         print("\n## Conversations\n")
