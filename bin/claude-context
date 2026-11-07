@@ -23,10 +23,29 @@ ROOT = os.path.expanduser("~/.claude/projects")
 HOST = socket.gethostname()
 KINDS = ("conversation", "studio", "subagent", "summarizer", "warmup")
 TOKENS = ("fresh", "cache_write", "cache_write_5m", "cache_write_1h", "cache_read", "output")
+# Unattended runs share a cwd (the home directory), so only their fixed first words tell them apart.
+AUTOMATIONS = (
+    ("Unattended nightly closing pass", "auto:ok closing"),
+    ("Unattended nightly run", "auto:ok"),
+    ("You validate pull request", "auto:ok merge"),
+    ("Unattended run of ops scripts/fleet-invariants", "fleet checks"),
+    ("Failure report on stdin", "digest"),
+    ("You diagnose an outage", "outage diag"),
+)
+LONG_CONTEXT = 200_000
 
 
 def project_of(cwd):
     return re.sub(r"/\.(claude/)?worktrees/.*$", "", cwd) if cwd else ""
+
+
+def work_of(cwd):
+    """The ticket a cwd belongs to, else its worktree: what tells a bake-off apart from steady use."""
+    ticket = re.search(r"\b(stu|hom|fx)-?(\d+)", cwd or "", re.I)
+    if ticket:
+        return f"{ticket[1].upper()}-{ticket[2]}"
+    worktree = re.search(r"/\.(?:claude/)?worktrees/(.+)$", cwd or "")
+    return worktree[1] if worktree else ""
 
 
 def short_name(path):
@@ -56,6 +75,11 @@ def classify(d):
     if d.get("permissionMode") == "bypassPermissions":
         return "studio"
     return "conversation"
+
+
+def automation_of(d):
+    text = first_text(d)
+    return next((name for prefix, name in AUTOMATIONS if text.startswith(prefix)), "")
 
 
 def image_size(b64):
@@ -96,7 +120,7 @@ def bucket_of(ts):
 
 
 def load(path, since):
-    t = {"kind": None, "session_id": None, "host": HOST}
+    t = {"kind": None, "session_id": None, "host": HOST, "automation": ""}
     custom, ai, cwd = None, None, None
     records = []
     # An image stays in the context, and is read back on each call, until a compaction drops it.
@@ -113,7 +137,7 @@ def load(path, since):
             elif kind == "ai-title":
                 ai = d.get("aiTitle")
             elif kind == "user" and t["kind"] is None:
-                t["kind"], t["session_id"] = classify(d), d.get("sessionId")
+                t["kind"], t["session_id"], t["automation"] = classify(d), d.get("sessionId"), automation_of(d)
             cwd = cwd or d.get("cwd")
             msg = d.get("message")
             if kind == "system" and d.get("subtype") == "compact_boundary":
@@ -151,6 +175,7 @@ def load(path, since):
     t["kind"] = t["kind"] or "conversation"
     t["title"] = custom or ai or ""
     t["cwd"] = project_of(cwd)
+    t["work"] = work_of(cwd)
     t["repo"] = short_name(t["cwd"])
     return t, records
 
@@ -197,8 +222,10 @@ def load_all(since):
         t["input"] = ctx(t)
         transcripts.append(t)
     titles = {t["session_id"]: t["title"] for t in transcripts if t["kind"] == "conversation" and t["title"]}
+    automations = {t["session_id"]: t["automation"] for t in transcripts if t["automation"]}
     for t in transcripts:
         t["title"] = t["title"] or titles.get(t["session_id"], "")
+        t["automation"] = t["automation"] or automations.get(t["session_id"], "")
     return list(calls.values()), transcripts, stats
 
 
@@ -420,9 +447,14 @@ def write_json(path, calls):
     rows = {}
     for c in calls:
         t = c["t"]
-        key = (t["host"], c["bucket"].isoformat(), t["cwd"], c["model"], t["kind"])
-        row = rows.setdefault(key, dict(zip(("host", "bucket", "cwd", "model", "kind"), key), calls=0, **dict.fromkeys(TOKENS, 0)))
+        key = (t["host"], c["bucket"].isoformat(), t["cwd"], c["model"], t["kind"], t["automation"], t["work"])
+        row = rows.setdefault(key, dict(
+            zip(("host", "bucket", "cwd", "model", "kind", "automation", "work"), key),
+            calls=0, long_context_calls=0, images=0, **dict.fromkeys(TOKENS, 0),
+        ))
         row["calls"] += 1
+        row["long_context_calls"] += ctx(c) > LONG_CONTEXT
+        row["images"] += c["image_count"]
         for k in TOKENS:
             row[k] += c[k]
     with open(path, "w", encoding="utf-8") as f:
