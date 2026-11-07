@@ -31,6 +31,9 @@ AUTOMATIONS = (
     ("Unattended run of ops scripts/fleet-invariants", "fleet checks"),
     ("Failure report on stdin", "digest"),
     ("You diagnose an outage", "outage diag"),
+    ("Call list_issues with label", "digest"),
+    ("Create one Linear document in project", "digest"),
+    ("Create one Linear issue in team HOM, project \"Dashboard\"", "containers check"),
 )
 LONG_CONTEXT = 200_000
 
