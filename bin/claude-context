@@ -341,10 +341,10 @@ def studio_run_dirs():
         dirs[:] = [x for x in dirs if x != "node_modules" and (not x.startswith(".") or x in (".studio", ".worktrees"))]
 
 
-def load_studio_records(since, week):
-    rows = defaultdict(lambda: defaultdict(int))
+def studio_stages(since):
+    """Every finished stage in Studio's run records: (runs directory's checkout, time, tokens by model)."""
     for runs in studio_run_dirs():
-        repo = short_name(project_of(runs[:-len("/.studio/runs")]))
+        cwd = project_of(runs[:-len("/.studio/runs")])
         for path in glob.glob(f"{runs}/*.jsonl"):
             if datetime.fromtimestamp(os.path.getmtime(path), timezone.utc) < since:
                 continue
@@ -357,14 +357,37 @@ def load_studio_records(since, week):
                     if not isinstance(e, dict) or e.get("event") != "stage_complete" or not e.get("ts"):
                         continue
                     ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
-                    if ts < since:
-                        continue
-                    for model, n in ((e.get("tokens") or {}).get("by_model") or {}).items():
-                        row = rows[(week({"bucket": bucket_of(ts)}), repo, model)]
-                        row["stages"] += 1
-                        for k in ("prompt_tokens", "cache_creation_tokens", "cached_input_tokens", "completion_tokens"):
-                            row[k] += n.get(k) or 0
+                    if ts >= since:
+                        yield cwd, ts, (e.get("tokens") or {}).get("by_model") or {}
+
+
+def load_studio_records(since, week):
+    rows = defaultdict(lambda: defaultdict(int))
+    for cwd, ts, by_model in studio_stages(since):
+        for model, n in by_model.items():
+            row = rows[(week({"bucket": bucket_of(ts)}), short_name(cwd), model)]
+            row["stages"] += 1
+            for k in ("prompt_tokens", "cache_creation_tokens", "cached_input_tokens", "completion_tokens"):
+                row[k] += n.get(k) or 0
     return rows
+
+
+def cli_overhead(since):
+    """Haiku calls the Claude CLI makes inside a Studio stage that works on another Claude model.
+
+    They leave no transcript, so they are the one part of Studio's records not already counted there.
+    A stage that lists only Haiku is an agent on Haiku, and its calls are in the transcripts.
+    """
+    for cwd, ts, by_model in studio_stages(since):
+        if not any(m.startswith("claude-") and "haiku" not in m for m in by_model):
+            continue
+        for model, n in by_model.items():
+            if model.startswith("claude-") and "haiku" in model:
+                yield dict(
+                    host=HOST, bucket=bucket_of(ts).isoformat(), cwd=cwd, model=model, kind="cli-overhead", automation="studio", work="",
+                    calls=1, long_context_calls=0, images=0, fresh=n.get("prompt_tokens") or 0, cache_write=n.get("cache_creation_tokens") or 0,
+                    cache_write_5m=0, cache_write_1h=0, cache_read=n.get("cached_input_tokens") or 0, output=n.get("completion_tokens") or 0,
+                )
 
 
 def report_studio(calls, rows, week):
@@ -446,7 +469,7 @@ def write_csv(path, transcripts, week):
             ])
 
 
-def write_json(path, calls):
+def write_json(path, calls, overhead=()):
     rows = {}
     for c in calls:
         t = c["t"]
@@ -460,6 +483,12 @@ def write_json(path, calls):
         row["images"] += c["image_count"]
         for k in TOKENS:
             row[k] += c[k]
+    for r in overhead:
+        key = (r["host"], r["bucket"], r["cwd"], r["model"], r["kind"], r["automation"], r["work"])
+        row = rows.setdefault(key, dict(r, calls=0, **dict.fromkeys(TOKENS, 0)))
+        row["calls"] += r["calls"]
+        for k in TOKENS:
+            row[k] += r[k]
     with open(path, "w", encoding="utf-8") as f:
         json.dump(sorted(rows.values(), key=lambda r: r["bucket"]), f, indent=1)
     return len(rows)
@@ -474,7 +503,7 @@ def main():
     )
     p.add_argument("--sessions", action="store_true", help="also list each conversation")
     p.add_argument("--csv", metavar="PATH", help="write one row per transcript to PATH")
-    p.add_argument("--json", metavar="PATH", help="write token counts per host, 5-minute bucket, cwd, model and kind to PATH")
+    p.add_argument("--json", metavar="PATH", help="write token counts per host, 5-minute bucket, cwd, model and kind to PATH, with the Claude CLI's own Haiku calls from Studio's records")
     p.add_argument("--studio-json", metavar="PATH", help="write Studio's own token counts per week, repo and model to PATH")
     args = p.parse_args()
 
@@ -520,7 +549,7 @@ def main():
         write_csv(args.csv, transcripts, week)
         print(f"\nCSV: {len(transcripts)} rows written to {args.csv}")
     if args.json:
-        print(f"\nJSON: {write_json(args.json, all_calls)} rows written to {args.json}")
+        print(f"\nJSON: {write_json(args.json, all_calls, cli_overhead(since))} rows written to {args.json}")
     if args.studio_json:
         # Apart from --json: these calls can also be in the transcripts, so adding them up would count them twice.
         with open(args.studio_json, "w", encoding="utf-8") as f:
