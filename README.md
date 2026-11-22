@@ -36,6 +36,28 @@ pull-all ~/work ~/dotfiles  # explicit directories
 git -C ~/work/app config pull-all.target develop
 ```
 
+## athena-run
+
+Runs a command on athena from the current git repository, so heavy jobs (a test suite that
+loads torch, a render, a build) never run on the laptop.
+
+```
+athena-run 'bun install --frozen-lockfile && bun test lib/house3d'
+athena-run --fetch report.json 'python3 scripts/measure.py > report.json'   # copy it back
+```
+
+Each run syncs the repo's git file list (tracked files, plus untracked ones git does not
+ignore) to `athena:athena-run/<repo>/<branch>/`. A file git ignores, such as `node_modules`
+or a `.venv`, stays there between runs; any other file missing from the list is deleted,
+so a file removed on the branch is gone on athena too. The command runs in the same
+subdirectory, through `bash -lc` with its arguments joined as ssh joins them, and the exit
+code is the command's. `--fetch <path>` (relative to that subdirectory, repeatable) copies
+a file or directory back afterwards, even when the command failed.
+
+Jobs run one at a time behind `flock ~/athena-run/lock` (a second one prints that it is
+waiting), at `nice 19` and idle IO priority, so the LLMs athena serves keep answering. An
+athena that does not answer within 5 s is reported as such: it may be powered off.
+
 ## claude-context
 
 Context size and token usage of every Claude Code session on the machine, read from the
